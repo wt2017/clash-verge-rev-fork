@@ -28,6 +28,13 @@ A Clash Meta GUI based on <a href="https://github.com/tauri-apps/tauri">Tauri</a
 
 ## Install
 
+### Prerequiste
+```
+sudo clash-verge-service-uninstall
+sudo clash-verge-service-install
+```
+只有安装了 clash-verge-service-install 之后 TUN 模式才能使能
+
 请到发布页面下载对应的安装包：[Release page](https://github.com/clash-verge-rev/clash-verge-rev/releases)<br>
 Go to the [Release page](https://github.com/clash-verge-rev/clash-verge-rev/releases) to download the corresponding installation package<br>
 Supports Windows (x64/x86), Linux (x64/arm64) and macOS 10.15+ (intel/apple).
