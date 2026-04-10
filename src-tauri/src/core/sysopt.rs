@@ -1,13 +1,8 @@
-#[cfg(target_os = "windows")]
-use crate::utils::schtasks as startup_task;
 use crate::{
     config::{Config, IVerge},
-    core::handle::Handle,
     singleton,
 };
 use anyhow::Result;
-#[cfg(not(target_os = "windows"))]
-use clash_verge_logging::logging_error;
 use clash_verge_logging::{Type, logging};
 use parking_lot::RwLock;
 use scopeguard::defer;
@@ -20,13 +15,10 @@ use std::{
     time::Duration,
 };
 use sysproxy::{Autoproxy, GuardMonitor, GuardType, Sysproxy};
-#[cfg(not(target_os = "windows"))]
-use tauri_plugin_autostart::ManagerExt as _;
-#[cfg(target_os = "windows")]
-use tauri_plugin_clash_verge_sysinfo::is_current_app_handle_admin;
+use tokio::sync::Mutex as TokioMutex;
 
 pub struct Sysopt {
-    update_sysproxy: AtomicBool,
+    update_lock: TokioMutex<()>,
     reset_sysproxy: AtomicBool,
     inner_proxy: Arc<RwLock<(Sysproxy, Autoproxy)>>,
     guard: Arc<RwLock<GuardMonitor>>,
@@ -35,7 +27,7 @@ pub struct Sysopt {
 impl Default for Sysopt {
     fn default() -> Self {
         Self {
-            update_sysproxy: AtomicBool::new(false),
+            update_lock: TokioMutex::new(()),
             reset_sysproxy: AtomicBool::new(false),
             inner_proxy: Arc::new(RwLock::new((Sysproxy::default(), Autoproxy::default()))),
             guard: Arc::new(RwLock::new(GuardMonitor::new(GuardType::None, Duration::from_secs(30)))),
@@ -116,94 +108,70 @@ impl Sysopt {
 
     /// init the sysproxy
     pub async fn update_sysproxy(&self) -> Result<()> {
-        if self.update_sysproxy.load(Ordering::Acquire) {
-            logging!(info, Type::Core, "Sysproxy update is already in progress.");
-            return Ok(());
-        }
-        if self
-            .update_sysproxy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            logging!(info, Type::Core, "Sysproxy update is already in progress.");
-            return Ok(());
-        }
-        defer! {
-            logging!(info, Type::Core, "Sysproxy update completed.");
-            self.update_sysproxy.store(false, Ordering::Release);
-        }
+        let _lock = self.update_lock.lock().await;
 
         let verge = Config::verge().await.latest_arc();
-        let port = {
-            let verge_port = verge.verge_mixed_port;
-            match verge_port {
-                Some(port) => port,
-                None => Config::clash().await.latest_arc().get_mixed_port(),
-            }
+        let port = match verge.verge_mixed_port {
+            Some(port) => port,
+            None => Config::clash().await.latest_arc().get_mixed_port(),
         };
         let pac_port = IVerge::get_singleton_port();
-
-        let (sys_enable, pac_enable, proxy_host, proxy_guard) = {
-            (
-                verge.enable_system_proxy.unwrap_or_default(),
-                verge.proxy_auto_config.unwrap_or_default(),
-                verge.proxy_host.clone().unwrap_or_else(|| String::from("127.0.0.1")),
-                verge.enable_proxy_guard.unwrap_or_default(),
-            )
-        };
-
+        let (sys_enable, pac_enable, proxy_host, proxy_guard) = (
+            verge.enable_system_proxy.unwrap_or_default(),
+            verge.proxy_auto_config.unwrap_or_default(),
+            verge.proxy_host.clone().unwrap_or_else(|| String::from("127.0.0.1")),
+            verge.enable_proxy_guard.unwrap_or_default(),
+        );
         // 先 await, 避免持有锁导致的 Send 问题
         let bypass = get_bypass().await;
 
-        let (sys, auto) = &mut *self.inner_proxy.write();
-        sys.enable = false;
-        sys.host = proxy_host.clone().into();
-        sys.port = port;
-        sys.bypass = bypass.into();
+        let (sys, auto, guard_type) = {
+            let (sys, auto) = &mut *self.inner_proxy.write();
+            sys.host = proxy_host.clone().into();
+            sys.port = port;
+            sys.bypass = bypass.into();
+            auto.url = format!("http://{proxy_host}:{pac_port}/commands/pac");
 
-        auto.enable = false;
-        auto.url = format!("http://{proxy_host}:{pac_port}/commands/pac");
+            // `enable_system_proxy` is the master switch.
+            // When disabled, force clear both global proxy and PAC at OS level.
+            let guard_type = if !sys_enable {
+                sys.enable = false;
+                auto.enable = false;
+                GuardType::None
+            } else if pac_enable {
+                sys.enable = false;
+                auto.enable = true;
+                if proxy_guard {
+                    GuardType::Autoproxy(auto.clone())
+                } else {
+                    GuardType::None
+                }
+            } else {
+                sys.enable = true;
+                auto.enable = false;
+                if proxy_guard {
+                    GuardType::Sysproxy(sys.clone())
+                } else {
+                    GuardType::None
+                }
+            };
 
-        self.access_guard().write().set_guard_type(GuardType::None);
+            (sys.clone(), auto.clone(), guard_type)
+        };
 
-        if !sys_enable && !pac_enable {
-            // disable proxy
+        self.access_guard().write().set_guard_type(guard_type);
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
             sys.set_system_proxy()?;
             auto.set_auto_proxy()?;
-            return Ok(());
-        }
-
-        if pac_enable {
-            sys.enable = false;
-            auto.enable = true;
-            sys.set_system_proxy()?;
-            auto.set_auto_proxy()?;
-            if proxy_guard {
-                self.access_guard()
-                    .write()
-                    .set_guard_type(GuardType::Autoproxy(auto.clone()));
-            }
-            return Ok(());
-        }
-
-        if sys_enable {
-            auto.enable = false;
-            sys.enable = true;
-            auto.set_auto_proxy()?;
-            sys.set_system_proxy()?;
-            if proxy_guard {
-                self.access_guard()
-                    .write()
-                    .set_guard_type(GuardType::Sysproxy(sys.clone()));
-            }
-            return Ok(());
-        }
+            Ok(())
+        })
+        .await??;
 
         Ok(())
     }
 
     /// reset the sysproxy
-    #[allow(clippy::unused_async)]
     pub async fn reset_sysproxy(&self) -> Result<()> {
         if self
             .reset_sysproxy
@@ -220,72 +188,20 @@ impl Sysopt {
         self.access_guard().write().set_guard_type(GuardType::None);
 
         // 直接关闭所有代理
-        let (sys, auto) = &mut *self.inner_proxy.write();
-        sys.enable = false;
-        sys.set_system_proxy()?;
-        auto.enable = false;
-        auto.set_auto_proxy()?;
+        let (sys, auto) = {
+            let (sys, auto) = &mut *self.inner_proxy.write();
+            sys.enable = false;
+            auto.enable = false;
+            (sys.clone(), auto.clone())
+        };
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            sys.set_system_proxy()?;
+            auto.set_auto_proxy()?;
+            Ok(())
+        })
+        .await??;
 
         Ok(())
-    }
-
-    /// update the startup
-    pub async fn update_launch(&self) -> Result<()> {
-        let enable_auto_launch = { Config::verge().await.latest_arc().enable_auto_launch };
-        let is_enable = enable_auto_launch.unwrap_or(false);
-        logging!(info, Type::System, "Setting auto-launch state to: {:?}", is_enable);
-
-        #[cfg(target_os = "windows")]
-        {
-            let is_admin = is_current_app_handle_admin(Handle::app_handle());
-            startup_task::set_auto_launch(is_enable, is_admin).await
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            self.try_original_autostart_method(is_enable);
-            Ok(())
-        }
-    }
-
-    /// 尝试使用原来的自启动方法
-    #[cfg(not(target_os = "windows"))]
-    fn try_original_autostart_method(&self, is_enable: bool) {
-        let app_handle = Handle::app_handle();
-        let autostart_manager = app_handle.autolaunch();
-
-        if is_enable {
-            logging_error!(Type::System, "{:?}", autostart_manager.enable());
-        } else {
-            logging_error!(Type::System, "{:?}", autostart_manager.disable());
-        }
-    }
-
-    /// 获取当前自启动的实际状态
-    pub fn get_launch_status(&self) -> Result<bool> {
-        #[cfg(target_os = "windows")]
-        {
-            let enabled = startup_task::is_auto_launch_enabled();
-            if let Ok(status) = enabled {
-                logging!(info, Type::System, "Auto launch status (scheduled task): {status}");
-            }
-            enabled
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            let app_handle = Handle::app_handle();
-            let autostart_manager = app_handle.autolaunch();
-            match autostart_manager.is_enabled() {
-                Ok(status) => {
-                    logging!(info, Type::System, "Auto launch status: {status}");
-                    Ok(status)
-                }
-                Err(e) => {
-                    logging!(error, Type::System, "Failed to get auto launch status: {e}");
-                    Err(anyhow::anyhow!("Failed to get auto launch status: {}", e))
-                }
-            }
-        }
     }
 }
